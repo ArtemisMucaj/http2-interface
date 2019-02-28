@@ -2,6 +2,7 @@
 
 const r = require('ramda')
 const http2 = require('http2')
+const { promisify } = require('util')
 
 const {
     HTTP2_HEADER_STATUS,
@@ -14,56 +15,73 @@ const {
 
 class Client {
     constructor(uri, logger = console) {
-        this.__uri = uri
-        this.__http2Client
-        this.__logger = logger
+        this.uri = uri
+        this.logger = logger
+        this.createSession()
     }
 
-    get logger() {
-        return this.__logger
+    ping() {
+        if (!this.isValid()) {
+            return
+        }
+
+        this.session.ping((error, duration) => {
+            if (!r.isNil(error)) {
+                this.logger.silly('No ping response after ' + duration + 'ms')
+            }
+            this.logger.silly('Ping response after ' + duration + 'ms')
+        })
+    }
+
+    isValid() {
+        return !r.isNil(this.session) && !this.session.destroyed
+    }
+
+    createSession() {
+        if (this.isValid()) {
+            return
+        }
+
+        this.session = http2.connect(this.uri, {})
+        this.session
+            .on('socketError', e => {
+                this.logger.error('Socket error', e)
+                this.destroy()
+            })
+            .on('error', e => {
+                this.logger.error('Client error', e)
+                this.destroy()
+            })
+
+        this.session
+            .on('connect', () => {
+                this.logger.silly('Session connected', this.uri)
+            })
+            .on('close', () => {
+                this.logger.silly('Session close', this.uri)
+            })
+            .on('frameError', (frameType, errorCode, streamId) => {
+                this.logger.silly(
+                    `Session Frame error: (frameType: ${frameType}, errorCode ${errorCode}, streamId: ${streamId}), for ${
+                        this.uri
+                    }`
+                )
+            })
+            .on('goaway', (errorCode, lastStreamId, opaqueData) => {
+                this.logger.silly(
+                    `Session GOAWAY received: (errorCode ${errorCode}, lastStreamId: ${lastStreamId}, opaqueData: ${opaqueData}), for ${
+                        this.uri
+                    }`
+                )
+                // gracefully stop accepting new streams
+                this.shutdown()
+            })
+
+        this.interval = setInterval(this.ping.bind(this), 60000).unref()
     }
 
     write(msg) {
-        if (r.isNil(this.__http2Client) || this.__http2Client.destroyed) {
-            this.__http2Client = http2.connect(this.__uri, {})
-            this.__http2Client
-                .on('socketError', e => {
-                    this.logger.error('Socket error', e)
-                    if (
-                        !r.isNil(this.__http2Client) &&
-                        !this.__http2Client.destroyed
-                    ) {
-                        this.__http2Client.destroy()
-                    }
-                })
-                .on('error', e => {
-                    this.logger.error('Client error', e)
-                    if (
-                        !r.isNil(this.__http2Client) &&
-                        !this.__http2Client.destroyed
-                    ) {
-                        this.__http2Client.destroy()
-                    }
-                })
-
-            this.__http2Client
-                .on('connect', () => {
-                    this.logger.silly('Http2Client connected', this.__uri)
-                })
-                .on('close', () => {
-                    this.logger.silly('Http2Client close', this.__uri)
-                })
-                .on('frameError', (frameType, errorCode, streamId) => {
-                    this.logger.silly(
-                        `Http2Client Frame error: (frameType: ${frameType}, errorCode ${errorCode}, streamId: ${streamId}), for ${this.__uri}`
-                    )
-                })
-                .on('goaway', (errorCode, lastStreamId, opaqueData) => {
-                    this.logger.silly(
-                        `Http2Client GOAWAY received: (errorCode ${errorCode}, lastStreamId: ${lastStreamId}, opaqueData: ${opaqueData}), for ${this.__uri}`
-                    )
-                })
-        }
+        this.createSession()
 
         let statusCode
         let responseData = ''
@@ -71,7 +89,7 @@ class Client {
         const headers = {
             [HTTP2_HEADER_METHOD]: HTTP2_METHOD_POST
         }
-        const request = this.__http2Client.request(headers)
+        const request = this.session.request(headers)
         request.setEncoding('utf8')
 
         request
@@ -116,9 +134,22 @@ class Client {
     }
 
     destroy() {
-        if (!r.isNil(this.__http2Client) && !this.__http2Client.destroyed) {
-            this.__http2Client.destroy()
+        if (this.isValid()) {
+            this.session.destroy()
         }
+    }
+
+    shutdown() {
+        if (!this.isValid()) {
+            return Promise.reject(new Error('Invalid session'))
+        }
+        if (!r.isNil(this.interval)) {
+            clearInterval(this.interval)
+        }
+        const gracefulShutdown = promisify(this.session.close)
+        return gracefulShutdown({ graceful: true }).then(() =>
+            this.session.destroy()
+        )
     }
 }
 

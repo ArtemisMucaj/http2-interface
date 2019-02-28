@@ -3,13 +3,9 @@
 const r = require('ramda')
 const http2 = require('http2')
 
-let Server
-
-module.exports = (port, fn) => {
-    if (r.isNil(Server)) {
-        Server = http2.createServer()
-    }
-    Server.on('stream', (stream, headers) => {
+module.exports = (port, options, fn) => {
+    const server = http2.createServer()
+    server.on('stream', (stream, headers) => {
         let buffers = []
         let responseData
         stream
@@ -34,11 +30,14 @@ module.exports = (port, fn) => {
                 }
             })
 
-        stream.respond({
-            'content-type': 'application/json',
-            ':status': 200
-        })
+        if (r.propOr(true, 'respond', options)) {
+            stream.respond({
+                'content-type': 'application/json',
+                ':status': 200
+            })
+        }
     })
-    Server.listen(port)
-    return Server
+
+    server.listen(port)
+    return server
 }
